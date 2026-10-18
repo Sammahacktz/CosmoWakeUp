@@ -1,0 +1,42 @@
+[project]
+name = "wakemeup-runtime"
+version = "0.1.0"
+description = "Run a WakeMeUp wakeword model: numpy and onnxruntime, nothing else"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Charlie-Luis Reichelt", email = "charlie-luis.reichelt@tu-dresden.de"}
+]
+keywords = ["wakeword", "keyword-spotting", "voice", "onnx", "home-assistant"]
+
+# Deliberately two. This is the half that runs on the device -- a Raspberry
+# Pi, a home assistant -- so torch, torchaudio and the whole training stack
+# stay out of the install.
+dependencies = [
+    "numpy>=1.21",
+    "onnxruntime>=1.16",
+]
+
+[project.optional-dependencies]
+# Only for listen() and `python -m wakemeup_runtime --mic`. Feeding audio in
+# yourself, which is what an application does, needs nothing extra.
+mic = ["sounddevice>=0.4"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+wakemeup-runtime = "wakemeup_runtime.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Sammahacktz/CosmoWakeUp"
+Source = "https://github.com/Sammahacktz/CosmoWakeUp"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["wakemeup_runtime"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
