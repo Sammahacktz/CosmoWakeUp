@@ -11,6 +11,9 @@
 Training happens elsewhere; nothing of it is needed here. What you download
 is three files -- the ONNX graph, its streaming twin and the JSON that says
 how to feed them -- and this reads them.
+
+A wakeword trained with openWakeWord runs here too: ``WakeWord("hey_jarvis.onnx")``,
+its ``.onnx`` alone; the features in front of it are computed here.
 """
 
 from ._resample import Resampler
@@ -28,4 +31,4 @@ __all__ = [
     "open_input_stream",
     "__version__",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

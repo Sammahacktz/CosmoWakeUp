@@ -1,7 +1,7 @@
 [project]
 name = "wakemeup-runtime"
-version = "0.1.0"
-description = "Run a WakeMeUp wakeword model: numpy and onnxruntime, nothing else"
+version = "0.2.0"
+description = "Run a WakeMeUp or openWakeWord wakeword model: numpy and onnxruntime, nothing else"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.9"

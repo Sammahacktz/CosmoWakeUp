@@ -5,6 +5,8 @@
     python -m wakemeup_runtime Kosmo.onnx --mic             # listen, with a meter
     python -m wakemeup_runtime Kosmo.onnx --bench           # CPU cost on this machine
     python -m wakemeup_runtime --list-devices               # which microphone?
+
+The model may also be one trained with openWakeWord (its .onnx, no .json).
 """
 
 from __future__ import annotations
@@ -48,6 +50,9 @@ def list_devices() -> int:
 
 def show_info(ear: WakeWord) -> int:
     meta = ear.metadata
+    if ear.kind == "openwakeword":
+        print(f"model      : openWakeWord, {meta['model']['embeddings']} embeddings in, "
+              f"features computed here ({meta['features']})")
     print(f"word       : {ear.word}")
     print(f"audio      : {ear.clip_seconds}s window @ {ear.sample_rate} Hz")
     print(f"threshold  : {ear.threshold:.2f}  (min_hits {ear.min_hits}, step {ear.step_ms} ms)")
@@ -111,7 +116,9 @@ def main(argv: list[str] | None = None) -> int:
         prog="wakemeup_runtime",
         description="Try a wakeword model on a file or a microphone.",
     )
-    parser.add_argument("model", nargs="?", help="path to the .onnx (its .json must be beside it)")
+    parser.add_argument(
+        "model", nargs="?", help="path to the .onnx: a WakeMeUp model (its .json beside it) or an openWakeWord model"
+    )
     parser.add_argument("audio", nargs="*", help="wav files to scan")
     parser.add_argument("--mic", action="store_true", help="listen on the microphone")
     parser.add_argument("--info", action="store_true", help="print what the model expects, and exit")
@@ -122,6 +129,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-hits", type=int, help="consecutive windows needed (default: the model's own)")
     parser.add_argument("--rate", type=int, help="preferred microphone rate")
     parser.add_argument("--device", help="microphone index or part of its name")
+    parser.add_argument(
+        "--features", help="openWakeWord models: embedding_model.onnx or its folder (default: fetched once)"
+    )
     args = parser.parse_args(argv)
 
     if args.list_devices:
@@ -134,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
         threshold=args.threshold,
         min_hits=args.min_hits,
         streaming=False if args.no_streaming else None,
+        features=args.features,
     )
 
     if args.info:

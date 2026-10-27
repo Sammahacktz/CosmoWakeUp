@@ -15,6 +15,10 @@ Everything the model needs to be used correctly -- its sample rate, how long
 a window it expects, the threshold the training run settled on -- travels in
 the ``.json`` file exported beside it, so the two are downloaded and kept
 together and there is nothing to configure by hand.
+
+A model trained with openWakeWord works the same way: point ``WakeWord`` at
+its ``.onnx``. It has no ``.json``; the features in front of it are computed
+here (see :mod:`._oww`).
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from typing import Any, Callable, Iterator, Sequence
 
 import numpy as np
 
+from . import _oww
 from ._resample import Resampler
 from .meter import amplitude_db
 
@@ -141,6 +146,14 @@ def open_input_stream(
     )
 
 
+def _onnxruntime():
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("wakemeup-runtime needs onnxruntime: pip install onnxruntime") from exc
+    return ort
+
+
 def input_devices() -> list[tuple[int, str, str, int]]:
     """Every microphone the system offers: ``(index, name, api, channels)``."""
     sd = _sounddevice()
@@ -174,6 +187,15 @@ class WakeWord:
     scoring the whole window. It is used whenever the step is the one it was
     built for (``streaming=None``); ``True`` insists on it, ``False`` scores
     whole windows. Both give the same scores.
+
+    ``model`` may also be an openWakeWord model (the ``.onnx`` its training
+    writes, recognised by its input of ``[batch, n, 96]`` embeddings). It
+    needs no sidecar: the mel spectrogram and the speech embedding in front of
+    it are computed here, the embedding model (``embedding_model.onnx``,
+    Apache 2.0) fetched once into ``~/.cache/wakemeup/oww`` or read from
+    ``features`` (the file or its folder). It streams in steps of 80 ms and
+    fires, as openWakeWord does, when one step scores ``threshold`` (0.5)
+    or more; :attr:`kind` says which sort of model was loaded.
     """
 
     def __init__(
@@ -187,12 +209,17 @@ class WakeWord:
         threads: int = 1,
         providers: Sequence[str] | None = None,
         streaming: bool | None = None,
+        features: str | Path | None = None,
     ) -> None:
         self.path = Path(model).expanduser()
         if not self.path.is_file():
             raise FileNotFoundError(f"no wakeword model at {self.path}")
 
-        meta = self._load_sidecar(self.path)
+        self._threads, self._providers = threads, providers
+        self._oww: _oww.OpenWakeWordModel | None = None  # an openWakeWord model with its feature stages
+        meta = self._load_metadata(features)
+        #: ``"wakemeup"`` or ``"openwakeword"``: which sort of model this is.
+        self.kind: str = "openwakeword" if self._oww is not None else "wakemeup"
         audio = meta["audio"]
 
         #: The word this model was trained on. For logs and for the user --
@@ -214,12 +241,14 @@ class WakeWord:
         self.step = max(1, int(self.sample_rate * self.step_ms / 1000))
         self.metadata: dict[str, Any] = meta
 
-        self._threads, self._providers = threads, providers
         self._session = None  # the window graph, opened when first needed
-        self._stream = self._open_stream(meta, streaming)
+        if self._oww is not None:
+            self._stream = self._oww_stream(streaming)
+        else:
+            self._stream = self._open_stream(meta, streaming)
         #: True when the model runs one step at a time on its streaming graph.
         self.streaming: bool = self._stream is not None
-        if not self.streaming:
+        if not self.streaming and self._oww is None:
             self._window_session()
 
         self._resamplers: dict[int, Resampler] = {}
@@ -244,6 +273,50 @@ class WakeWord:
         )
 
     # -- construction helpers ---------------------------------------------
+
+    def _load_metadata(self, features: str | Path | None) -> dict:
+        """The sidecar of a WakeMeUp model; for an openWakeWord model, what its graph says.
+
+        A ``.json`` beside the model makes it a WakeMeUp model. Without one,
+        the graph decides: an input of ``[batch, n, 96]`` embeddings is
+        openWakeWord's layout; anything else is a WakeMeUp model whose sidecar
+        is missing, and is reported as that.
+        """
+        if self.path.suffix.lower() == ".tflite":
+            raise ValueError(
+                f"{self.path.name}: .tflite models are not supported. openWakeWord's training "
+                f"writes an .onnx beside it; use that."
+            )
+        if not self.path.with_suffix(".json").is_file():
+            _onnxruntime()
+            try:
+                session = self._open_session(self.path)
+            except Exception:  # noqa: BLE001 - not a graph onnxruntime can read
+                session = None
+            if session is not None and _oww.is_openwakeword(session):
+                self._oww = _oww.OpenWakeWordModel(session, self._open_session, features)
+                return {
+                    "format": "openwakeword",
+                    "wakeword": self.path.stem,
+                    "threshold": 0.5,
+                    "audio": {"sample_rate": _oww.SAMPLE_RATE, "clip_seconds": self._oww.window / _oww.SAMPLE_RATE},
+                    # openWakeWord's own rule: one step over the threshold is a detection
+                    "detect": {"step_seconds": _oww.STEP / _oww.SAMPLE_RATE, "min_hits": 1, "refractory_seconds": 2.0},
+                    "model": {"embeddings": self._oww.n_embeddings},
+                    "features": str(self._oww.features_path),
+                }
+        return self._load_sidecar(self.path)
+
+    def _oww_stream(self, streaming: bool | None):
+        """The openWakeWord model step by step, when the step is its 80 ms; else None (whole windows)."""
+        if streaming is False:
+            return None
+        if self.step != _oww.STEP:
+            if streaming:
+                raise ValueError(f"openWakeWord models step {_oww.STEP} samples (80 ms); leave step_ms at its default")
+            logger.info("step %d ms is not openWakeWord's 80 ms; scoring whole windows", self.step_ms)
+            return None
+        return self._oww
 
     @staticmethod
     def _load_sidecar(model: Path) -> dict:
@@ -282,12 +355,7 @@ class WakeWord:
         return max(1, int(min_hits)), float(refractory), int(step_ms)
 
     def _open_session(self, path: Path):
-        try:
-            import onnxruntime as ort
-        except ImportError as exc:  # pragma: no cover
-            raise RuntimeError(
-                "wakemeup-runtime needs onnxruntime: pip install onnxruntime"
-            ) from exc
+        ort = _onnxruntime()
 
         # One thread by default. This runs ten times a second beside a live
         # audio stream, and onnxruntime otherwise fans out across every core
@@ -354,6 +422,8 @@ class WakeWord:
 
     def _stream_step(self, block: np.ndarray) -> float:
         """Advance the streaming graph by one step; the probability of the window ending here."""
+        if self._oww is not None:
+            return self._oww.step(block)
         out = self._stream.run(None, {"audio": block[None, :].astype(np.float32), **self._state})
         self._state = dict(zip(self._state_order, out[1:]))
         return float(1.0 / (1.0 + np.exp(-float(np.reshape(out[0], -1)[0]))))
@@ -416,6 +486,8 @@ class WakeWord:
 
     def score(self, window: np.ndarray) -> float:
         """Probability that one window of exactly :attr:`window` samples is the word."""
+        if self._oww is not None:
+            return self._oww.window_score(window)
         logit = self._window_session().run(None, {self._input: window[None, :].astype(np.float32)})[0]
         return float(1.0 / (1.0 + np.exp(-float(np.reshape(logit, -1)[0]))))
 
@@ -434,7 +506,9 @@ class WakeWord:
         self._position = 0
         self._fired_at = 0
         self.probability = 0.0
-        if self._stream is not None:
+        if self._oww is not None:
+            self._oww.reset()
+        elif self._stream is not None:
             self._state = {k: v.copy() for k, v in self._silence.items()}
         for resampler in self._resamplers.values():
             resampler.reset()
@@ -522,5 +596,6 @@ class WakeWord:
     def __repr__(self) -> str:
         return (
             f"WakeWord({self.word!r}, {self.clip_seconds}s @ {self.sample_rate}Hz, "
-            f"threshold={self.threshold:.2f}{', streaming' if self.streaming else ''})"
+            f"threshold={self.threshold:.2f}{', streaming' if self.streaming else ''}"
+            f"{', openWakeWord' if self._oww is not None else ''})"
         )

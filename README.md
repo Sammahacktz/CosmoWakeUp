@@ -1,7 +1,9 @@
 # CosmoWakeUp
 
 Run a WakeMeUp wakeword on a device: the Python package `wakemeup-runtime`.
-Two dependencies, one class, no training stack.
+Two dependencies, one class, no training stack. A wakeword you trained
+yourself with [openWakeWord](https://github.com/dscripka/openWakeWord) runs
+here too, through the same class (see [openWakeWord models](#openwakeword-models)).
 
 ```bash
 pip install "git+https://github.com/Sammahacktz/CosmoWakeUp.git"
@@ -133,6 +135,47 @@ what to watch while deciding.
 Call `ear.reset()` whenever the microphone has been hearing something that must
 not become a detection — your own speaker above all — and after any gap in
 capture.
+
+## openWakeWord models
+
+A model trained with openWakeWord (the `.onnx` its training notebook writes)
+is loaded the same way, from its `.onnx` alone:
+
+```python
+ear = WakeWord("hey_jarvis.onnx")      # no .json: recognised by its input
+if ear.feed(block, rate=48_000):
+    print(f"heard {ear.word}")
+```
+
+```bash
+python -m wakemeup_runtime hey_jarvis.onnx --info
+python -m wakemeup_runtime hey_jarvis.onnx --mic
+```
+
+So you can use the wakeword you got from WakeMeUp, or train another one with
+openWakeWord's own tools and run it here without changing your code.
+
+- **What is computed here.** An openWakeWord model is only the last stage: it
+  scores the speech embeddings of the last 16 (or so) steps of 80 ms. The
+  stages in front of it are computed by this package: the mel spectrogram in
+  numpy, and Google's speech embedding with `embedding_model.onnx`, which is
+  fetched once from openWakeWord's v0.5.1 release (1.3 MB, checked against its
+  SHA-256) into `~/.cache/wakemeup/oww` (or `$WAKEMEUP_CACHE_DIR/oww`). Offline,
+  download it yourself and pass `WakeWord(..., features="path/to/embedding_model.onnx")`
+  or `--features`. The features equal those inside a WakeMeUp model, to about
+  1e-6.
+- **Detection.** As in openWakeWord: one step scoring `threshold` (default
+  0.5) or more is a detection (`min_hits=1`), then `refractory` (2 s) of not
+  listening; the first 5 steps score 0. All three can be set as for any model.
+- **`.onnx` only.** openWakeWord also exports `.tflite`; this package runs
+  onnxruntime, so use the `.onnx` written beside it. Models with more than one
+  wakeword in one file (several outputs) are not supported: load one per model.
+- **Licences.** The speech embedding is Google's, under the Apache License
+  2.0. openWakeWord's own pre-trained wakewords ("hey jarvis", "alexa", ...)
+  are under CC BY-NC-SA 4.0, so not for commercial use; a model you train
+  yourself is yours to license.
+- **Cost.** About 1.6 ms per 80 ms step on one desktop core, like a WakeMeUp
+  model's streaming graph (`--bench` measures it on your device).
 
 ## Notes
 

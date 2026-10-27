@@ -206,6 +206,131 @@ def test_hears_the_wakeword_and_ignores_other_speech():
     assert len(false_alarms) <= 1, f"{len(false_alarms)} false wakes in a minute of speech"
 
 
+# -- openWakeWord models ----------------------------------------------------
+
+#: Where the feature models are cached (the training fetches them there too); the
+#: tests that need them skip rather than download.
+FEATURES = Path(os.environ.get("WAKEMEUP_CACHE_DIR") or Path.home() / ".cache" / "wakemeup") / "oww"
+needs_features = pytest.mark.skipif(
+    not (FEATURES / "embedding_model.onnx").is_file(), reason="no embedding_model.onnx in the cache"
+)
+#: The real model's head alone, in openWakeWord's layout (`wakemeup export --oww-head`)
+OWW_HEAD = MODEL.with_name(MODEL.stem + ".oww-head.onnx")
+
+
+def tiny_oww_model(path: Path, n: int = 16) -> Path:
+    """An openWakeWord-shaped model: ``[1, n, 96]`` embeddings in, ``[1, 1]`` probability out."""
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    nodes = [
+        helper.make_node("ReduceMean", ["x"], ["mean"], axes=[1, 2], keepdims=1),
+        helper.make_node("Flatten", ["mean"], ["flat"], axis=1),
+        helper.make_node("Sigmoid", ["flat"], ["p"]),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "tiny",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, n, 96])],
+        [helper.make_tensor_value_info("p", TensorProto.FLOAT, [1, 1])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.save(model, str(path))
+    return path
+
+
+def test_the_mel_spectrogram_is_openwakewords():
+    """The numpy front end against openWakeWord's own melspectrogram.onnx."""
+    from wakemeup_runtime._oww import melspectrogram
+
+    reference = FEATURES / "melspectrogram.onnx"
+    if not reference.is_file():
+        pytest.skip("no melspectrogram.onnx in the cache")
+    import onnxruntime as ort
+
+    pcm = np.random.default_rng(1).standard_normal(16_000).astype(np.float32) * 3000
+    session = ort.InferenceSession(str(reference), providers=["CPUExecutionProvider"])
+    theirs = np.squeeze(session.run(None, {session.get_inputs()[0].name: pcm[None]})[0]) / 10 + 2
+    ours = melspectrogram(pcm)
+    assert ours.shape == (97, 32)  # one frame per 10 ms that a whole 512-sample frame fits
+    np.testing.assert_allclose(ours, theirs[: ours.shape[0]], atol=1e-4)
+
+
+@needs_features
+def test_an_openwakeword_model_needs_no_sidecar(tmp_path):
+    ear = WakeWord(tiny_oww_model(tmp_path / "hey_tiny.onnx"), features=FEATURES)
+    assert ear.kind == "openwakeword" and ear.word == "hey_tiny" and ear.streaming
+    # openWakeWord's window, step and rule: 16 embeddings of 80 ms, one step over 0.5 fires
+    assert (ear.window, ear.step, ear.threshold, ear.min_hits) == (31712, 1280, 0.5, 1)
+    ear.threshold = 2.0
+    steps = []
+    for start in range(0, 16_000 * 2, ear.step):
+        ear.feed(np.full(ear.step, 0.01, dtype=np.float32))
+        steps.append(ear.probability)
+    assert steps[:5] == [0.0] * 5 and 0.0 < steps[5] < 1.0  # openWakeWord's first five steps say nothing
+
+
+@needs_features
+def test_an_openwakeword_model_scores_the_same_streamed_or_in_windows(tmp_path):
+    path = tiny_oww_model(tmp_path / "tiny.onnx")
+    stream, window = WakeWord(path, features=FEATURES), WakeWord(path, features=FEATURES, streaming=False)
+    assert stream.streaming and not window.streaming
+    audio = (np.random.default_rng(5).standard_normal(16_000 * 3) * 0.05).astype(np.float32)
+    for ear in (stream, window):
+        ear.threshold = 2.0
+        ear.feed(audio)
+    assert stream.probability == pytest.approx(window.probability, abs=1e-5)
+
+
+def test_the_embedding_model_is_found_where_it_is_said_to_be(tmp_path):
+    from wakemeup_runtime._oww import embedding_model
+
+    (tmp_path / "embedding_model.onnx").write_bytes(b"model")
+    assert embedding_model(tmp_path) == embedding_model(tmp_path / "embedding_model.onnx")
+    with pytest.raises(FileNotFoundError, match="no embedding_model.onnx"):
+        embedding_model(tmp_path / "elsewhere")
+
+
+def test_tflite_models_point_to_the_onnx(tmp_path):
+    model = tmp_path / "hey_jarvis.tflite"
+    model.write_bytes(b"tflite")
+    with pytest.raises(ValueError, match="use that"):
+        WakeWord(model)
+
+
+@needs_features
+@pytest.mark.skipif(not OWW_HEAD.is_file(), reason="no openWakeWord head of the exported model")
+def test_the_models_head_in_openwakewords_layout_hears_what_the_model_hears():
+    """Features computed here, in front of the bare head, equal the ones inside the whole model."""
+    positives = sorted(Path("H:/wakeword/training_data/positive").glob("kosmo_plain_openai_sage_*.wav"))[:2]
+    if not positives:
+        pytest.skip("training audio not mounted")
+    from wakemeup_runtime import Resampler
+
+    rng = np.random.default_rng(0)
+    parts = []
+    for path in positives:
+        with wave.open(str(path), "rb") as handle:
+            rate = handle.getframerate()
+            clip = np.frombuffer(handle.readframes(handle.getnframes()), dtype=np.int16).astype(np.float32) / 32768
+        parts += [(rng.standard_normal(32_000) * 0.003).astype(np.float32), Resampler(rate, 16_000).process(clip)]
+    audio = np.concatenate([*parts, np.zeros(32_000, dtype=np.float32)])
+
+    native, oww = WakeWord(MODEL), WakeWord(OWW_HEAD, features=FEATURES)
+    assert native.kind == "wakemeup" and oww.kind == "openwakeword"
+    scores = {"native": [], "oww": []}
+    for ear in (native, oww):
+        ear.threshold = 2.0
+    for start in range(0, audio.size - 1280 + 1, 1280):
+        for name, ear in (("native", native), ("oww", oww)):
+            ear.feed(audio[start : start + 1280])
+            scores[name].append(ear.probability)
+    native_scores, oww_scores = (np.array(scores[k][30:]) for k in ("native", "oww"))  # both warmed up
+    assert native_scores.max() > 0.9  # the word is in there
+    np.testing.assert_allclose(oww_scores, native_scores, atol=1e-4)
+
+
 # -- the meter --------------------------------------------------------------
 
 
